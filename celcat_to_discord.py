@@ -1,29 +1,31 @@
-# celcat_html_to_discord.py — Embeds par cours (demain)
+# Envoi quotidien de l'emploi du temps CELCAT par email pour "demain".
 # - Vise "demain" (Europe/Paris), force ?dt=YYYY-MM-DD sur l'URL listWeek
 # - Parse la page listWeek (Playwright) en blocs : horaire -> (titre, enseignants, salle, type)
-# - Envoie 1 embed Discord par cours : titre=nom du cours, champs Horaires/Enseignants/Salle/Type (+ emojis)
-# - Chaque embed a une couleur inspirée du logo (#E6443A) et un lien vers la semaine CELCAT
+# - Compose un email résumant les événements du lendemain avec un lien vers CELCAT
 
-import os, re, asyncio, datetime as dt, requests
+import os, re, asyncio, datetime as dt, smtplib
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from dateutil.tz import gettz
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+from email.message import EmailMessage
 
 # ------------ Config ------------
 load_dotenv()
-WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
 LIST_URL_TEMPLATE = os.getenv("CELCAT_LIST_URL")
 TZ_NAME  = os.getenv("TZ_NAME", "Europe/Paris")
 TZ = gettz(TZ_NAME)
 
-DEBUG=1
+EMAIL_SMTP_HOST = os.getenv("EMAIL_SMTP_HOST")
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+EMAIL_USERNAME  = os.getenv("EMAIL_USERNAME")
+EMAIL_PASSWORD  = os.getenv("EMAIL_PASSWORD")
+EMAIL_FROM      = os.getenv("EMAIL_FROM")
+EMAIL_TO        = [addr.strip() for addr in os.getenv("EMAIL_TO", "").split(",") if addr.strip()]
+EMAIL_USE_TLS   = os.getenv("EMAIL_USE_TLS", "true").lower() in ("1", "true", "yes", "on")
 
-assert WEBHOOK and LIST_URL_TEMPLATE, "Config manquante: DISCORD_WEBHOOK_URL / CELCAT_LIST_URL"
-
-MD_SPECIALS = re.compile(r"([_*~`>])")
-def md_escape(s: str) -> str:
-    return MD_SPECIALS.sub(r"\\\1", s)
+assert LIST_URL_TEMPLATE, "Config manquante: CELCAT_LIST_URL"
+assert EMAIL_SMTP_HOST and EMAIL_FROM and EMAIL_TO, "Config manquante: EMAIL_SMTP_HOST / EMAIL_FROM / EMAIL_TO"
 
 # ------------ Dates / FR ------------
 JOURS_FR = ["lundi","mardi","mercredi","jeudi","vendredi","samedi","dimanche"]
@@ -187,40 +189,53 @@ async def fetch_week_text(url: str) -> str:
         await browser.close()
         return text
 
-# ------------ Embeds Discord ------------
-def build_embeds(events: list[dict], day_label: str, timestamp_iso: str, week_url: str) -> dict:
+# ------------ Email ------------
+def build_email_content(events: list[dict], day_label: str, week_url: str) -> tuple[str, str]:
+    subject = f"Emploi du temps du {day_label}"
+
+    lines = [
+        "Bonjour,",
+        "",
+        f"Voici l'emploi du temps prévu pour {day_label} :",
+        "",
+    ]
+
     if not events:
-        return {"content": f"🗓️ **{day_label}** — *Aucun cours prévu pour demain.*\n<{week_url}>"}
+        lines.append("- Aucun cours n'est prévu.")
+    else:
+        for event in events:
+            lines.append(f"- {event['start']}–{event['end']} : {event['title']}")
+            if event.get("room"):
+                lines.append(f"  Salle : {event['room']}")
+            if event.get("teachers"):
+                lines.append(f"  Enseignants : {event['teachers']}")
+            if event.get("type"):
+                lines.append(f"  Type : {event['type']}")
+            lines.append("")
 
-    embeds = []
-    for e in events[:10]:  # Discord autorise jusqu'à 10 embeds par message
-        fields = []
-        fields.append({"name": "🕒 Horaires", "value": f"**{e['start']}–{e['end']}**", "inline": True})
-        if e.get("teachers"):
-            fields.append({"name": "👩‍🏫 Enseignants", "value": md_escape(e["teachers"])[:1024], "inline": False})
-        if e.get("room"):
-            fields.append({"name": "🏫 Salle", "value": md_escape(e["room"]), "inline": True})
-        if e.get("type"):
-            fields.append({"name": "🏷️ Type", "value": md_escape(e["type"])[:1024], "inline": True})
+    lines.extend([
+        f"Détails complets : {week_url}",
+        "",
+        "Bonne journée !",
+    ])
 
-        embed = {
-            "title": e["title"][:256],     # Titre = nom du cours
-            "type": "rich",
-            "url": week_url,               # clic → semaine CELCAT
-            "timestamp": timestamp_iso,
-            "color": int("E6443A", 16),    # Couleur proche du logo
-            "fields": fields,
-            "footer": {"text": f"Extrait de CELCAT"}
-        }
-        embeds.append(embed)
+    body_text = "\n".join(lines)
+    return subject, body_text
 
-    # petit en-tête simple au-dessus des embeds
-    content = f"🗓️ **{day_label}** — emploi du temps de demain :"
-    return {"content": content, "embeds": embeds}
 
-def post_discord(payload: dict):
-    r = requests.post(WEBHOOK, json=payload, timeout=30)
-    r.raise_for_status()
+def send_email(subject: str, body_text: str):
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = EMAIL_FROM
+    message["To"] = ", ".join(EMAIL_TO)
+    message.set_content(body_text)
+
+    with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=30) as smtp:
+        if EMAIL_USE_TLS:
+            smtp.starttls()
+        if EMAIL_USERNAME and EMAIL_PASSWORD:
+            smtp.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        smtp.send_message(message)
 
 # ------------ Main ------------
 async def main():
@@ -232,8 +247,8 @@ async def main():
     full_text = await fetch_week_text(week_url)
     events = parse_specific_day(full_text, tomorrow)
     day_label = french_date(tomorrow, capitalize_first=True)
-    payload = build_embeds(events, day_label, now.isoformat(), week_url)
-    post_discord(payload)
+    subject, body_text = build_email_content(events, day_label, week_url)
+    send_email(subject, body_text)
 
 if __name__ == "__main__":
     asyncio.run(main())
